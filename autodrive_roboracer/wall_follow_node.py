@@ -43,7 +43,7 @@ class WallFollowNode(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
+    rclpy.init(args=args, signal_handler_options=rclpy.SignalHandlerOptions.NO)    
     node = WallFollowNode()
     try:
         rclpy.spin(node)
