@@ -5,16 +5,17 @@ The idea: We try to decipher the "shape" of the upcoming wall on
 each side of the car and figure out how sharply the track is about to bend.
 That is done in tangent_follower.py (see there for more info).
 
-This first version only does the steering. Preliminary version has
-constant (slow) speed
+This second version still only controls the steering. But it also now logs
+the speed, lap times, and wall contacts for future use.
 """
-
+import math
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Float32
+from nav_msgs.msg import Odometry
+from std_msgs.msg import Float32, Int32
 
 try:
     from autodrive_roboracer import tangent_follower   # inside the ROS package
@@ -26,6 +27,10 @@ except ImportError:                                    # running the file on its
 LIDAR_TOPIC = '/autodrive/roboracer_1/lidar'
 THROTTLE_TOPIC = '/autodrive/roboracer_1/throttle_command'
 STEERING_TOPIC = '/autodrive/roboracer_1/steering_command'
+ODOM_TOPIC = '/autodrive/roboracer_1/odom'
+LAST_LAP_TOPIC = '/autodrive/roboracer_1/last_lap_time'
+BEST_LAP_TOPIC = '/autodrive/roboracer_1/best_lap_time'
+COLLISION_TOPIC = '/autodrive/roboracer_1/collision_count'
 
 # Scan geometry: 1080 beams, -135 deg to +135 deg, 0.25 deg step.
 # 0 deg is straight ahead, +90 deg is straight left. Range ~0.06 m to 10 m.
@@ -68,6 +73,20 @@ class WallFollowNode(Node):
         self.throttle_pub = self.create_publisher(Float32, THROTTLE_TOPIC, qos)
         self.steering_pub = self.create_publisher(Float32, STEERING_TOPIC, qos)
 
+        # Extra inputs, only used for logging: speed, lap times, wall contacts.
+        self.speed = 0.0
+        self.create_subscription(Odometry, ODOM_TOPIC, self.odom_callback, qos)
+        self.create_subscription(Float32, LAST_LAP_TOPIC, self.last_lap_callback, qos)
+        self.create_subscription(Float32, BEST_LAP_TOPIC, self.best_lap_callback, qos)
+        self.create_subscription(Int32, COLLISION_TOPIC, self.collision_callback, qos)
+        self.last_lap = None
+        self.best_lap = None
+        self.collisions = None
+        # Lap bookkeeping, so different versions can be compared fairly.
+        self.hit_this_lap = False
+        self.clean_laps = []        # times of laps with no wall contact
+        self.clean_streak = 0       # clean laps in a row (the challenge needs 3)
+
         self.scan_count = 0
         self.get_logger().info('wall_follow_node started, steering = tangent follower')
 
@@ -80,7 +99,49 @@ class WallFollowNode(Node):
         self.scan_count += 1
         if self.scan_count % 40 == 0:
             self.get_logger().info(
-                f"{info['summary']}  steer {steering:+.2f}  throttle {throttle:.2f}")
+                f"{info['summary']}  steer {steering:+.2f}  throttle {throttle:.2f}  speed {self.speed:3.1f} m/s")
+
+    def odom_callback(self, msg: Odometry):
+        v = msg.twist.twist.linear
+        self.speed = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+
+    def last_lap_callback(self, msg: Float32):
+        if self.last_lap is None:
+            self.last_lap = msg.data
+            return
+        if msg.data > 0 and msg.data != self.last_lap:
+            self.last_lap = msg.data
+            if self.hit_this_lap:
+                self.clean_streak = 0
+                verdict = 'HIT A WALL (does not count)'
+            else:
+                self.clean_laps.append(msg.data)
+                self.clean_streak += 1
+                verdict = 'clean'
+            self.hit_this_lap = False
+            n = len(self.clean_laps)
+            stats = ''
+            if n:
+                # Median of the last 5 clean laps: a typical lap time that one odd lap
+                # (like a slow first lap from a standing start) can't distort.
+                recent = sorted(self.clean_laps[-5:])
+                typical = recent[len(recent) // 2] if len(recent) % 2 else \
+                    0.5 * (recent[len(recent) // 2 - 1] + recent[len(recent) // 2])
+                stats = (f' | clean laps: {n}, typical (median of last 5) {typical:.2f} s,'
+                         f' best {min(self.clean_laps):.2f} s')
+            self.get_logger().info(
+                f'LAP {msg.data:.2f} s ({verdict}) | clean in a row: {self.clean_streak}{stats}')
+
+    def best_lap_callback(self, msg: Float32):
+        if msg.data > 0 and msg.data != self.best_lap:
+            self.best_lap = msg.data
+            self.get_logger().info(f'NEW BEST LAP: {msg.data:.2f} s')
+
+    def collision_callback(self, msg: Int32):
+        if self.collisions is not None and msg.data > self.collisions:
+            self.hit_this_lap = True
+            self.get_logger().warn(f'COLLISION! total = {msg.data}')
+        self.collisions = msg.data
 
     def publish_command(self, throttle: float, steering: float):
         """Clamp to [-1, 1] and publish throttle and steering."""

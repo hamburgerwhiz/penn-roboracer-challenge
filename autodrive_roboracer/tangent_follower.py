@@ -1,34 +1,37 @@
 #!/usr/bin/env python3
 """
-Claude's summary of my approach:
+Summary of my approach (updated manually for reader's ease of understanding):
 
 For EACH side of the car (left and right) separately:
 
-  1. Expected wall ("e"). Fit a straight line through the wall points right
-     beside the car (beams 75..105 deg on that side). That line is "what the
-     wall would look like if the track stayed straight". Fitting a line (rather
+  1. We first imagine the expected wall ("e"). This can be visualized by 
+     fiting a straight line through the wall points directly parallel
+     beside the car (i.e. beams 75..105 deg on that side). That line is what 
+     the wall would look like if the track stayed "straight". Fitting a line (rather
      than assuming the wall is parallel to the car) means a car that is angled
      to the wall doesn't see a fake curve.
 
-  2. Reality vs expectation ("r - e"). Walk the beams from 90 deg (beside the
-     car) toward straight ahead. For each beam, measure how far its hit point
-     is from the expected line, SIDEWAYS (perpendicular to the wall), in meters.
-     Measuring sideways keeps one threshold valid at every angle.
+  2. Calculate the deviation of reality wall vs expectation wall ("r - e"). 
+     Walk the beams from 90 deg (beside the car) toward straight ahead. 
+     For each beam, measure how far its hit point is from the expected line, SIDEWAYS 
+    (perpendicular to the wall), in meters. Measuring sideways keeps one threshold 
+    valid at every angle.
          dev > 0 : wall is farther than expected ("falls away", r > e)
          dev < 0 : wall is closer than expected ("closes in", r < e)
 
   3. First significant deviation = DEV_COUNT beams in a row with |dev| above
-     DEV_THRESHOLD and the same sign.
+     DEV_THRESHOLD and the same sign. This decides what the first significant
+     curve or deviation in the path ahead that the car must adjust to.
 
-  4. Turn needed:
-       Case A (falls away, r > e): the track bends toward this side. The last
+  4. Figuring out the turn needed:
+       Case 1 (veers away, r > e): the track bends outwards. The last
          beam that still matched the expected wall grazes the inside corner,
          so its direction is the tangent to approach. Aim at that corner point,
-         shifted CORNER_MARGIN off the wall so we don't clip it.
-       Case B (closes in, r < e): the wall turns in front of us. Measure the
+         shifted some arb. "CORNER_MARGIN" var off the wall so we don't clip it.
+       Case 2 (closes in, r < e): the wall turns in front of us. Measure the
          direction of the wall just past the first deviation (a short segment
          of SEGMENT_BEAMS beams) and line up with it.
-       Case C (no deviation): the wall is straight. Line up with it gently.
+       Case 3 (no deviation): the wall is straight. Continue as normal.
      In each case we know (heading change needed) and (distance until we
      must have it). heading / distance = turn per meter = CURVATURE, and
      curvature maps straight to a steering angle: angle = atan(curvature * L),
