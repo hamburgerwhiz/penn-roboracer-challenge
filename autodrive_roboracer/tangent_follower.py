@@ -43,6 +43,11 @@ Combine the two sides (positive = turn LEFT, the car's convention):
                                     (shorter path), or the non-zero one
   * opposite directions         -> track widening/narrowing: add them
 
+
+Safety mechanism (last-ditch prevention to avoid wall collision)
+  * WALL_PUSH: if a wall is closer than PUSH_DIST, steer incrementally away from it.
+    (The original idea only controls heading, so nothing would stop a slow
+    sideways collision into a wall on a straight path)
 """
 
 import math
@@ -65,6 +70,8 @@ SEGMENT_BEAMS = 12          # case B: beams used to measure the new wall directi
 CORNER_MARGIN = 0.50        # m, case A: aim this far off the inside corner
 ALIGN_LOOKAHEAD = 2.0       # m, case C: line up with a straight wall over this distance
 ZERO_CURV = 0.05            # 1/m, smaller curvatures count as "zero" when combining
+WALL_PUSH = 2.0             # 1/m per m too close. 0 = pure original idea
+PUSH_DIST = 0.50            # m, start pushing away from a wall this close
 # ---------------------------------------------------------------------------
 
 def analyse_side(r, angles, side):
@@ -176,6 +183,11 @@ def tangent_steering(r, angles):
     left = analyse_side(r, angles, +1)
     right = analyse_side(r, angles, -1)
     kappa, rule = combine(left, right)
+
+    # Addition: push away from a wall that is too close.
+    for side, info in ((+1, left), (-1, right)):
+        if info and info['min_dist'] < PUSH_DIST:
+            kappa -= side * WALL_PUSH * (PUSH_DIST - info['min_dist'])
 
     steer_angle = math.atan(kappa * WHEELBASE)
     demand = max(-1.0, min(1.0, steer_angle / MAX_STEER_RAD))

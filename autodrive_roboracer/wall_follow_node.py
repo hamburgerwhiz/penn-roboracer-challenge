@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Wall-following node for the AutoDRIVE RoboRacer simulator (first version).
+"""Wall-following node for the AutoDRIVE RoboRacer simulator.
 
 The idea: We try to decipher the "shape" of the upcoming wall on
 each side of the car and figure out how sharply the track is about to bend.
 That is done in tangent_follower.py (see there for more info).
 
-This second version still only controls the steering. But it also now logs
-the speed, lap times, and wall contacts for future use.
+This third version still runs at a constant slow speed. It adds two
+safety steps after the steering is chosen: ease off steering toward a wall
+that is right beside the car, and smooth the steering a little.
 """
 import math
+import time
+
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -38,6 +41,18 @@ COLLISION_TOPIC = '/autodrive/roboracer_1/collision_count'
 # +1 steering = full lock left (~0.52 rad).
 
 MAX_RANGE = 10.0            # m, LiDAR max range
+
+SIDE_HARD = 0.30            # m, wall this close beside us: no steering toward it at all
+SIDE_SOFT = 0.45            # m, wall farther than this: steer freely. In between, steering
+                            # toward that wall is eased off smoothly (no sudden snap).
+SIDE_MIN_ANGLE = math.radians(70)     # "beside the car" = 70..135 deg on each side
+SIDE_MAX_ANGLE = math.radians(135)
+
+MAX_STEER_RAD = 0.52        # rad, steering command +1 = full lock left
+
+# Steering smoothing (the scan arrives ~85 times a second, so a little filtering is invisible).
+STEER_SMOOTH = 0.4          # 0 = no filtering, 0.9 = very heavy. Fraction of the old value kept per scan.
+STEER_RATE = 20.0           # max steering change per second (a full-lock swing, 2.0, takes 2/20 = 0.1 s)
 CRUISE_THROTTLE = 0.10      # constant throttle. Speed is roughly 24 * throttle (0.10 -> 2.4 m/s)
 
 
@@ -48,17 +63,45 @@ def clean_ranges(ranges):
     return np.clip(r, 0.0, MAX_RANGE)
 
 
-def compute_command(ranges, angle_min, angle_increment):
-    """Input: raw scan in. 
-       Output: throttle, steering, debug info
-    """
+def side_factor(min_dist):
+    """0 when a wall is very close beside us, 1 when it is comfortably far."""
+    return max(0.0, min(1.0, (min_dist - SIDE_HARD) / (SIDE_SOFT - SIDE_HARD)))
+
+
+def compute_command(ranges, angle_min, angle_increment, speed=None, prev_steer=None, dt=0.012):
+    """Raw scan in, (throttle, steering, debug info) out.
+    `speed`       current speed in m/s (not used yet)
+    `prev_steer`  steering we sent last scan (None = no smoothing)
+    `dt`          seconds since the last scan"""
     r = clean_ranges(ranges)
     angles = angle_min + np.arange(len(r)) * angle_increment
 
     steering, summary = tangent_follower.tangent_steering(r, angles)
     steering = max(-1.0, min(1.0, steering))
 
-    info = {'target_speed': CRUISE_THROTTLE * 24.0, 'corner': abs(steering), 'summary': summary}
+    # Side safety: ease off steering toward a wall that is close beside us.
+    # (Smooth transition instead of snapping the wheels straight.)
+    left = r[(angles >= SIDE_MIN_ANGLE) & (angles <= SIDE_MAX_ANGLE)]
+    right = r[(angles <= -SIDE_MIN_ANGLE) & (angles >= -SIDE_MAX_ANGLE)]
+    blocked = ''
+    if steering > 0 and left.size:
+        f = side_factor(float(left.min()))
+        if f < 1.0:
+            steering, blocked = steering * f, 'left'
+    elif steering < 0 and right.size:
+        f = side_factor(float(right.min()))
+        if f < 1.0:
+            steering, blocked = steering * f, 'right'
+    steering = max(-1.0, min(1.0, steering))
+
+    # Smooth the steering: blend with last scan's value, and limit how fast it can change.
+    if prev_steer is not None:
+        smoothed = prev_steer + (steering - prev_steer) * (1.0 - STEER_SMOOTH)
+        step = max(-STEER_RATE * dt, min(STEER_RATE * dt, smoothed - prev_steer))
+        steering = prev_steer + step
+
+    info = {'target_speed': CRUISE_THROTTLE * 24.0, 'corner': abs(steering), 'blocked': blocked,
+            'summary': summary}
     return CRUISE_THROTTLE, steering, info
 
 
@@ -87,19 +130,29 @@ class WallFollowNode(Node):
         self.clean_laps = []        # times of laps with no wall contact
         self.clean_streak = 0       # clean laps in a row (the challenge needs 3)
 
+        # State carried from one scan to the next (for smoothing).
+        self.prev_steer = None
+        self.prev_time = None
+
         self.scan_count = 0
         self.get_logger().info('wall_follow_node started, steering = tangent follower')
 
     def scan_callback(self, scan: LaserScan):
+        now = time.monotonic()
+        dt = 0.012 if self.prev_time is None else max(0.004, min(0.05, now - self.prev_time))
+        self.prev_time = now
+
         throttle, steering, info = compute_command(
-            scan.ranges, scan.angle_min, scan.angle_increment)
+            scan.ranges, scan.angle_min, scan.angle_increment, self.speed, self.prev_steer, dt)
+        self.prev_steer = steering
         self.publish_command(throttle, steering)
 
         # Log about twice a second (scans arrive ~85 times a second).
         self.scan_count += 1
         if self.scan_count % 40 == 0:
             self.get_logger().info(
-                f"{info['summary']}  steer {steering:+.2f}  throttle {throttle:.2f}  speed {self.speed:3.1f} m/s")
+                f"{info['summary']}  steer {steering:+.2f}  throttle {throttle:.2f}  speed {self.speed:3.1f} m/s"
+                + (f"  (blocked {info['blocked']})" if info['blocked'] else ''))
 
     def odom_callback(self, msg: Odometry):
         v = msg.twist.twist.linear
