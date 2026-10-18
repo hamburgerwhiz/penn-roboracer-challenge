@@ -5,8 +5,8 @@ The idea: We try to decipher the "shape" of the upcoming wall on
 each side of the car and figure out how sharply the track is about to bend.
 That is done in tangent_follower.py (see there for more info).
 
-This fourth version also controls the speed: slow down for sharp turns, brake
-in time for a wall ahead, and accelerate smoothly out of corners.
+This fifth version adjusts speed along curves more dynamically, limiting corner speed by available grip,
+slows early for a turn that is coming up, and brakes actively when too fast.
 """
 import math
 import time
@@ -52,7 +52,7 @@ MAX_STEER_RAD = 0.52        # rad, steering command +1 = full lock left
 # Speed. From the first test run, throttle acts like a speed setting:
 # speed (m/s) is roughly SPEED_PER_THROTTLE * throttle (0.12 -> 3.0 m/s).
 SPEED_PER_THROTTLE = 24.0
-MAX_SPEED = 4.0             # m/s, top speed on straights
+MAX_SPEED = 6.0             # m/s, top speed on straights
 CORNER_SPEED = 1.8          # m/s, speed at full steering lock
 MIN_SPEED = 1.0             # m/s, never go slower than this
 BRAKE_DECEL = 4.0           # m/s^2, how hard we plan to brake (smaller = brake earlier)
@@ -69,9 +69,29 @@ CORNER_RELEASE = 3.0        # per second. How fast the remembered sharpness (0..
 
 THROTTLE_MAX = 0.60         # never command more throttle than this
 THROTTLE_MIN = 0.0          # never command less (negative might mean reverse; untested)
+ACTIVE_BRAKE = 0.4          # max NEGATIVE throttle used to brake when we're too fast (0 = coast
+                            # only, as before). Only used above BRAKE_MIN_SPEED, so it can never
+                            # make the car reverse.
+BRAKE_GAIN = 0.3            # negative throttle per m/s we are over the target speed
+BRAKE_MIN_SPEED = 1.5       # m/s, never brake actively below this
 STOP_MARGIN = 1.0           # m, plan to be slowed down this far before the wall ahead
 CORRIDOR_HALF_WIDTH = 0.18  # m, "straight ahead" = a strip about as wide as the car itself.
                             # Wider than the car and walls beside us count as "ahead".
+ARC_BRAKE = 1.0             # 0 = brake for the wall STRAIGHT ahead (old behaviour).
+                            # 1 = brake for the first wall along the CURVED path the car is
+                            #     actually steering (much faster out of corners: on a corner exit
+                            #     the nose points at the outside wall, but the car is turning
+                            #     away from it). In between = a blend.
+LAT_ACCEL = 8.0             # m/s^2, sideways grip we trust in a turn. Corner speed limit is
+                            # v = sqrt(LAT_ACCEL / curvature): wide loops fast, tight turns slow.
+                            # Car slides into walls in turns -> lower (6). Too timid -> raise (10).
+                            # 0 = off.
+TURN_LOOKAHEAD = 2.0        # m. Anticipates TIGHTENING corners: finds the gentlest turn that
+                            # still has this much clear road, and slows to the speed that turn
+                            # allows (sqrt(LAT_ACCEL / curvature)). Bigger = slows earlier. 0 = off.
+TURN_HALF_WIDTH = 0.25      # m, clearance used for that check (a bit wider than the car)
+LIDAR_X = 0.27              # m, LiDAR sits this far ahead of the rear axle (turning centre)
+WHEELBASE = 0.33            # m
 
 # Steering smoothing (the scan arrives ~85 times a second, so a little filtering is invisible).
 STEER_SMOOTH = 0.4          # 0 = no filtering, 0.9 = very heavy. Fraction of the old value kept per scan.
@@ -83,6 +103,38 @@ def clean_ranges(ranges):
     r = np.array(ranges, dtype=float)
     r = np.nan_to_num(r, nan=0.0, posinf=MAX_RANGE, neginf=0.0)
     return np.clip(r, 0.0, MAX_RANGE)
+
+
+def arc_free_distance(r, angles, steer, half_width=None):
+    """How far the car can drive along the circle it is steering (steer in [-1, 1],
+    held constant) before a wall point comes within CORRIDOR_HALF_WIDTH of its path.
+    Measured as distance travelled along the arc, in meters."""
+    hw = CORRIDOR_HALF_WIDTH if half_width is None else half_width
+    kappa = math.tan(steer * MAX_STEER_RAD) / WHEELBASE     # 1/m, + = left
+    valid = r > 0.06
+    x, y = r * np.cos(angles), r * np.sin(angles)
+    if abs(kappa) < 0.02:                                  # basically straight
+        hit = valid & (x > 0) & (np.abs(y) < hw)
+        return float(x[hit].min()) if hit.any() else MAX_RANGE
+    R = 1.0 / kappa                                        # signed turn radius (rear axle)
+    cx, cy = -LIDAR_X, R                                   # turning centre, LiDAR frame
+    R_l = math.hypot(LIDAR_X, R)                           # radius the LiDAR point travels on
+    dx, dy = x - cx, y - cy
+    d = np.hypot(dx, dy)
+    near_path = valid & (np.abs(d - R_l) < hw)
+    # Angle swept around the centre from the LiDAR's position to each point,
+    # in the direction the car is turning.
+    a0 = math.atan2(0.0 - cy, 0.0 - cx)
+    sweep = (np.arctan2(dy, dx) - a0) * math.copysign(1.0, kappa)
+    sweep = np.mod(sweep, 2 * math.pi)
+    max_sweep = min(math.pi, MAX_RANGE / R_l)              # look half a circle ahead at most
+    hit = near_path & (sweep > 0) & (sweep < max_sweep)
+    if not hit.any():
+        return max_sweep * R_l
+    return float((sweep[hit] * R_l).min())
+
+
+TURN_FAN = np.linspace(-1.0, 1.0, 21)    # steering values checked by the turn-ahead limit
 
 
 def side_factor(min_dist):
@@ -139,7 +191,20 @@ def compute_command(ranges, angle_min, angle_increment, speed=None,
 
     # Speed limit 1 (braking): pick a speed we can brake from in time before the
     # wall straight ahead (fwd_dist, measured above): v = sqrt(2 * decel * distance).
-    v_brake = math.sqrt(2.0 * BRAKE_DECEL * max(0.0, fwd_dist - STOP_MARGIN))
+    # With ARC_BRAKE, also measure along the curves the car is about to drive: any
+    # steering between what the wheels do now and what the algorithm asks for. If
+    # one of those curves is clearer than straight ahead (typical on a corner exit,
+    # nose pointing at the outside wall while turning away from it), brake for that.
+    # Never less room than straight ahead, so this is never MORE cautious than before.
+    if ARC_BRAKE > 0:
+        lo, hi = sorted((steering, demand))
+        arc_dist = max(arc_free_distance(r, angles, s)
+                       for s in np.linspace(lo, hi, 5))
+        arc_dist = max(arc_dist, fwd_dist)
+        brake_dist = fwd_dist + ARC_BRAKE * (arc_dist - fwd_dist)
+    else:
+        arc_dist = brake_dist = fwd_dist
+    v_brake = math.sqrt(2.0 * BRAKE_DECEL * max(0.0, brake_dist - STOP_MARGIN))
 
     # Speed limit 2 (cornering): the sharper the turn, the slower we go.
     # Uses the real turn sharpness (not the eased steering), and remembers a
@@ -148,10 +213,31 @@ def compute_command(ranges, angle_min, angle_increment, speed=None,
     if prev_corner is not None:
         corner = max(corner, prev_corner - CORNER_RELEASE * dt)
     v_corner = MAX_SPEED + (CORNER_SPEED - MAX_SPEED) * corner
+    # Grip limit from the actual curvature of the turn: v^2 * curvature <= LAT_ACCEL.
+    # (Uses the sharper of the turn asked for and the turn the wheels are making.)
+    kappa = math.tan(max(corner, abs(steering)) * MAX_STEER_RAD) / WHEELBASE
+    if LAT_ACCEL > 0 and kappa > 1e-3:
+        v_corner = min(v_corner, math.sqrt(LAT_ACCEL / kappa))
+
+    # Speed limit 3 (turn ahead): of all the curves the car could steer, which is the
+    # gentlest one with TURN_LOOKAHEAD of clear road? The car will need at least that
+    # much turn soon, so don't arrive faster than that turn allows.
+    v_turn = MAX_SPEED
+    if TURN_LOOKAHEAD > 0 and LAT_ACCEL > 0:
+        need_k = math.tan(MAX_STEER_RAD) / WHEELBASE       # nothing clear: full lock
+        for s_ in TURN_FAN:
+            k_ = abs(math.tan(s_ * MAX_STEER_RAD) / WHEELBASE)
+            if k_ < need_k and arc_free_distance(r, angles, s_, TURN_HALF_WIDTH) >= TURN_LOOKAHEAD:
+                need_k = k_
+        if need_k > 1e-3:
+            v_turn = math.sqrt(LAT_ACCEL / need_k)
+    v_corner = min(v_corner, v_turn)
+
     target_speed = max(MIN_SPEED, min(MAX_SPEED, v_brake, v_corner))
     # Which limit is holding the speed down (shown in the log).
     limit = ('top speed' if target_speed >= MAX_SPEED - 1e-6 else
-             'wall ahead' if v_brake <= v_corner else 'cornering')
+             'wall ahead' if v_brake <= v_corner else
+             'turn ahead' if v_turn <= v_corner + 1e-9 and v_turn < MAX_SPEED else 'cornering')
     # The target may drop instantly (braking) but can only rise at ACCEL_LIMIT.
     if prev_target is not None and target_speed > prev_target + ACCEL_LIMIT * dt:
         target_speed = prev_target + ACCEL_LIMIT * dt
@@ -163,8 +249,15 @@ def compute_command(ranges, angle_min, angle_increment, speed=None,
         throttle += KP_SPEED * (target_speed - speed)
     throttle = max(THROTTLE_MIN, min(THROTTLE_MAX, throttle))
 
+    # Active braking: coasting alone sheds speed too slowly before tight corners.
+    over = (speed - target_speed) if speed is not None else 0.0
+    if ACTIVE_BRAKE > 0 and over > 0.5 and speed > BRAKE_MIN_SPEED:
+        throttle = -min(ACTIVE_BRAKE, BRAKE_GAIN * (over - 0.2))
+        limit += ', braking'
+
     info = {
         'fwd_dist': fwd_dist,
+        'arc_dist': arc_dist,
         'limit': limit,
         'target_speed': target_speed,
         'corner': corner,
@@ -226,7 +319,7 @@ class WallFollowNode(Node):
         if self.scan_count % 40 == 0:
             self.get_logger().info(
                 f"{info['summary']}  "
-                f"ahead {info['fwd_dist']:4.1f} m  "
+                f"ahead {info['fwd_dist']:4.1f} m (path {info['arc_dist']:4.1f})  "
                 f"steer {steering:+.2f}  throttle {throttle:.2f}  "
                 f"want {info['target_speed']:3.1f} / have {self.speed:3.1f} m/s "
                 f"[{info['limit']}]"
