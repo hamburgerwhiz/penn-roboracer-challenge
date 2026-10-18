@@ -5,9 +5,13 @@ The idea: We try to decipher the "shape" of the upcoming wall on
 each side of the car and figure out how sharply the track is about to bend.
 That is done in tangent_follower.py (see there for more info).
 
-This fifth version adjusts speed along curves more dynamically, limiting corner speed by available grip,
-slows early for a turn that is coming up, and brakes actively when too fast.
+This sixth version adds a preventative mechanism: if the curve about to be driven runs
+into a wall, then drive the nearest clear curve instead. This is motivated by the 
+bottom right of the curve, which is a common place to hit the wall on a corner exit. 
+For the life of me I can't figure out why the tangent follower wants to drive into that wall,
+so I'll slap a bandaid on the symptom for the time being...
 """
+
 import math
 import time
 
@@ -52,7 +56,7 @@ MAX_STEER_RAD = 0.52        # rad, steering command +1 = full lock left
 # Speed. From the first test run, throttle acts like a speed setting:
 # speed (m/s) is roughly SPEED_PER_THROTTLE * throttle (0.12 -> 3.0 m/s).
 SPEED_PER_THROTTLE = 24.0
-MAX_SPEED = 6.0             # m/s, top speed on straights
+MAX_SPEED = 7.0             # m/s, top speed on straights
 CORNER_SPEED = 1.8          # m/s, speed at full steering lock
 MIN_SPEED = 1.0             # m/s, never go slower than this
 BRAKE_DECEL = 4.0           # m/s^2, how hard we plan to brake (smaller = brake earlier)
@@ -90,6 +94,13 @@ TURN_LOOKAHEAD = 2.0        # m. Anticipates TIGHTENING corners: finds the gentl
                             # still has this much clear road, and slows to the speed that turn
                             # allows (sqrt(LAT_ACCEL / curvature)). Bigger = slows earlier. 0 = off.
 TURN_HALF_WIDTH = 0.25      # m, clearance used for that check (a bit wider than the car)
+ARC_GUARD = 1.0             # 1 = steering guard: if the curve we're about to drive hits a wall
+                            # within GUARD_MIN + GUARD_TIME * speed meters, steer the nearest
+                            # curve that is clear instead (catches both turning too late and
+                            # over-turning past an apex). 0 = off.
+GUARD_MIN = 0.6             # m
+GUARD_TIME = 0.3            # s
+GUARD_HALF_WIDTH = 0.22     # m, clearance the guard demands on each side of the path
 LIDAR_X = 0.27              # m, LiDAR sits this far ahead of the rear axle (turning centre)
 WHEELBASE = 0.33            # m
 
@@ -135,6 +146,7 @@ def arc_free_distance(r, angles, steer, half_width=None):
 
 
 TURN_FAN = np.linspace(-1.0, 1.0, 21)    # steering values checked by the turn-ahead limit
+GUARD_FAN = np.linspace(-1.0, 1.0, 21)   # steering values the guard may choose from
 
 
 def side_factor(min_dist):
@@ -164,6 +176,19 @@ def compute_command(ranges, angle_min, angle_increment, speed=None,
     # The tangent follower (see tangent_follower.py) decides the steering.
     steering, summary = tangent_follower.tangent_steering(r, angles)
     steering = max(-1.0, min(1.0, steering))
+
+    # Steering guard: is the curve we're about to drive clear for long enough?
+    if ARC_GUARD > 0:
+        need = GUARD_MIN + GUARD_TIME * (speed or 0.0)
+        if arc_free_distance(r, angles, steering, GUARD_HALF_WIDTH) < need:
+            free = np.array([arc_free_distance(r, angles, s_, GUARD_HALF_WIDTH) for s_ in GUARD_FAN])
+            ok = free >= need
+            if ok.any():       # the clear curve closest to what the algorithm wanted
+                pick = GUARD_FAN[ok][np.argmin(np.abs(GUARD_FAN[ok] - steering))]
+            else:              # nothing is clear: take the one with the most room
+                pick = GUARD_FAN[int(np.argmax(free))]
+            summary += f'  GUARD {steering:+.2f}->{pick:+.2f}'
+            steering = float(pick)
 
     # How sharp the turn really is, before any easing or smoothing. Speed uses this.
     demand = max(-1.0, min(1.0, steering))
