@@ -5,9 +5,8 @@ The idea: We try to decipher the "shape" of the upcoming wall on
 each side of the car and figure out how sharply the track is about to bend.
 That is done in tangent_follower.py (see there for more info).
 
-This third version still runs at a constant slow speed. It adds two
-safety steps after the steering is chosen: ease off steering toward a wall
-that is right beside the car, and smooth the steering a little.
+This fourth version also controls the speed: slow down for sharp turns, brake
+in time for a wall ahead, and accelerate smoothly out of corners.
 """
 import math
 import time
@@ -50,10 +49,33 @@ SIDE_MAX_ANGLE = math.radians(135)
 
 MAX_STEER_RAD = 0.52        # rad, steering command +1 = full lock left
 
+# Speed. From the first test run, throttle acts like a speed setting:
+# speed (m/s) is roughly SPEED_PER_THROTTLE * throttle (0.12 -> 3.0 m/s).
+SPEED_PER_THROTTLE = 24.0
+MAX_SPEED = 4.0             # m/s, top speed on straights
+CORNER_SPEED = 1.8          # m/s, speed at full steering lock
+MIN_SPEED = 1.0             # m/s, never go slower than this
+BRAKE_DECEL = 4.0           # m/s^2, how hard we plan to brake (smaller = brake earlier)
+KP_SPEED = 0.04             # extra throttle per m/s of speed shortfall (0 = off). This is what
+                            # makes the car accelerate hard when it is slower than it wants to be.
+ACCEL_LIMIT = 6.0           # m/s^2, how fast the TARGET speed may rise (braking is instant).
+                            # Stops the target from flickering up and down and jerking the throttle.
+                            # Smaller = smoother but slower out of corners.
+
+# Corner memory: after a sharp turn, keep driving at corner speed for a moment
+# instead of flooring it the instant the steering relaxes (matters in S-bends).
+CORNER_RELEASE = 3.0        # per second. How fast the remembered sharpness (0..1) fades.
+                            # 3.0 = from full lock to "straight" in about 0.33 s. Smaller = more cautious.
+
+THROTTLE_MAX = 0.60         # never command more throttle than this
+THROTTLE_MIN = 0.0          # never command less (negative might mean reverse; untested)
+STOP_MARGIN = 1.0           # m, plan to be slowed down this far before the wall ahead
+CORRIDOR_HALF_WIDTH = 0.18  # m, "straight ahead" = a strip about as wide as the car itself.
+                            # Wider than the car and walls beside us count as "ahead".
+
 # Steering smoothing (the scan arrives ~85 times a second, so a little filtering is invisible).
 STEER_SMOOTH = 0.4          # 0 = no filtering, 0.9 = very heavy. Fraction of the old value kept per scan.
 STEER_RATE = 20.0           # max steering change per second (a full-lock swing, 2.0, takes 2/20 = 0.1 s)
-CRUISE_THROTTLE = 0.10      # constant throttle. Speed is roughly 24 * throttle (0.10 -> 2.4 m/s)
 
 
 def clean_ranges(ranges):
@@ -68,16 +90,31 @@ def side_factor(min_dist):
     return max(0.0, min(1.0, (min_dist - SIDE_HARD) / (SIDE_SOFT - SIDE_HARD)))
 
 
-def compute_command(ranges, angle_min, angle_increment, speed=None, prev_steer=None, dt=0.012):
+def compute_command(ranges, angle_min, angle_increment, speed=None,
+                    prev_steer=None, prev_target=None, dt=0.012, prev_corner=None):
     """Raw scan in, (throttle, steering, debug info) out.
-    `speed`       current speed in m/s (not used yet)
+    `speed`       current speed in m/s (None = no speed feedback)
     `prev_steer`  steering we sent last scan (None = no smoothing)
-    `dt`          seconds since the last scan"""
+    `prev_target` target speed from last scan (None = no ramp limit)
+    `dt`          seconds since the last scan
+    `prev_corner` remembered turn sharpness from last scan"""
     r = clean_ranges(ranges)
     angles = angle_min + np.arange(len(r)) * angle_increment
 
+    # How far is the nearest wall straight ahead, inside a strip as wide as the car?
+    # (Used for braking below.)
+    fwd_mask = np.abs(angles) < math.radians(45)
+    xs = r[fwd_mask] * np.cos(angles[fwd_mask])
+    ys = r[fwd_mask] * np.sin(angles[fwd_mask])
+    in_strip = (np.abs(ys) < CORRIDOR_HALF_WIDTH) & (r[fwd_mask] > 0.0)
+    fwd_dist = float(xs[in_strip].min()) if in_strip.any() else MAX_RANGE
+
+    # The tangent follower (see tangent_follower.py) decides the steering.
     steering, summary = tangent_follower.tangent_steering(r, angles)
     steering = max(-1.0, min(1.0, steering))
+
+    # How sharp the turn really is, before any easing or smoothing. Speed uses this.
+    demand = max(-1.0, min(1.0, steering))
 
     # Side safety: ease off steering toward a wall that is close beside us.
     # (Smooth transition instead of snapping the wheels straight.)
@@ -100,9 +137,41 @@ def compute_command(ranges, angle_min, angle_increment, speed=None, prev_steer=N
         step = max(-STEER_RATE * dt, min(STEER_RATE * dt, smoothed - prev_steer))
         steering = prev_steer + step
 
-    info = {'target_speed': CRUISE_THROTTLE * 24.0, 'corner': abs(steering), 'blocked': blocked,
-            'summary': summary}
-    return CRUISE_THROTTLE, steering, info
+    # Speed limit 1 (braking): pick a speed we can brake from in time before the
+    # wall straight ahead (fwd_dist, measured above): v = sqrt(2 * decel * distance).
+    v_brake = math.sqrt(2.0 * BRAKE_DECEL * max(0.0, fwd_dist - STOP_MARGIN))
+
+    # Speed limit 2 (cornering): the sharper the turn, the slower we go.
+    # Uses the real turn sharpness (not the eased steering), and remembers a
+    # recent sharp turn for a moment so the car doesn't surge mid-corner.
+    corner = abs(demand)
+    if prev_corner is not None:
+        corner = max(corner, prev_corner - CORNER_RELEASE * dt)
+    v_corner = MAX_SPEED + (CORNER_SPEED - MAX_SPEED) * corner
+    target_speed = max(MIN_SPEED, min(MAX_SPEED, v_brake, v_corner))
+    # Which limit is holding the speed down (shown in the log).
+    limit = ('top speed' if target_speed >= MAX_SPEED - 1e-6 else
+             'wall ahead' if v_brake <= v_corner else 'cornering')
+    # The target may drop instantly (braking) but can only rise at ACCEL_LIMIT.
+    if prev_target is not None and target_speed > prev_target + ACCEL_LIMIT * dt:
+        target_speed = prev_target + ACCEL_LIMIT * dt
+        limit = 'accel ramp'
+    # Throttle = the throttle that should hold the target speed, plus a push
+    # proportional to how far we are below it (or a pull-back if we are above it).
+    throttle = target_speed / SPEED_PER_THROTTLE
+    if speed is not None:
+        throttle += KP_SPEED * (target_speed - speed)
+    throttle = max(THROTTLE_MIN, min(THROTTLE_MAX, throttle))
+
+    info = {
+        'fwd_dist': fwd_dist,
+        'limit': limit,
+        'target_speed': target_speed,
+        'corner': corner,
+        'blocked': blocked,
+        'summary': summary,
+    }
+    return throttle, steering, info
 
 
 class WallFollowNode(Node):
@@ -132,7 +201,9 @@ class WallFollowNode(Node):
 
         # State carried from one scan to the next (for smoothing).
         self.prev_steer = None
+        self.prev_target = None
         self.prev_time = None
+        self.prev_corner = None
 
         self.scan_count = 0
         self.get_logger().info('wall_follow_node started, steering = tangent follower')
@@ -143,15 +214,22 @@ class WallFollowNode(Node):
         self.prev_time = now
 
         throttle, steering, info = compute_command(
-            scan.ranges, scan.angle_min, scan.angle_increment, self.speed, self.prev_steer, dt)
+            scan.ranges, scan.angle_min, scan.angle_increment, self.speed,
+            self.prev_steer, self.prev_target, dt, self.prev_corner)
+        self.prev_corner = info['corner']
         self.prev_steer = steering
+        self.prev_target = info['target_speed']
         self.publish_command(throttle, steering)
 
         # Log about twice a second (scans arrive ~85 times a second).
         self.scan_count += 1
         if self.scan_count % 40 == 0:
             self.get_logger().info(
-                f"{info['summary']}  steer {steering:+.2f}  throttle {throttle:.2f}  speed {self.speed:3.1f} m/s"
+                f"{info['summary']}  "
+                f"ahead {info['fwd_dist']:4.1f} m  "
+                f"steer {steering:+.2f}  throttle {throttle:.2f}  "
+                f"want {info['target_speed']:3.1f} / have {self.speed:3.1f} m/s "
+                f"[{info['limit']}]"
                 + (f"  (blocked {info['blocked']})" if info['blocked'] else ''))
 
     def odom_callback(self, msg: Odometry):
